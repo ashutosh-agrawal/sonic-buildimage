@@ -6,7 +6,6 @@ import pytest
 from bgpcfgd.directory import Directory
 from bgpcfgd.managers_static_rt import (
     StaticRouteMgr,
-    _valid_interface_name,
     _valid_vrf_name,
 )
 from bgpcfgd.template import TemplateFabric
@@ -143,7 +142,7 @@ def test_invalid_vrf_name(name):
     ("Ethernet0/1", False),
 ])
 def test_interface_name_policy(name, expected):
-    assert _valid_interface_name(name) is expected
+    assert swsscommon.isInterfaceNameValid(name) is expected
 
 
 def test_set():
@@ -1280,4 +1279,3 @@ def test_set_bfd_true():
             "exit"
         ]
     )
-
