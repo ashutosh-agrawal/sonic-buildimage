@@ -400,6 +400,12 @@ install_deb_package $debs_path/sonic-host-services-rs_*.deb
 # Install sonic-db-cli
 install_deb_package $debs_path/sonic-db-cli_*.deb
 
+# Install dormant Redis writer-authentication helpers. No unit invokes them yet.
+sudo install -m 0755 $IMAGE_CONFIGS/redis-auth/redis_auth_prepare.py \
+    $FILESYSTEM_ROOT/usr/bin/redis_auth_prepare.py
+sudo install -m 0755 $IMAGE_CONFIGS/redis-auth/profile-renderer/redis_client_profile_renderer.py \
+    $FILESYSTEM_ROOT/usr/bin/redis_client_profile_renderer.py
+
 
 {% if include_system_eventd == "y" and build_reduce_image_size != "y" %}
 # Install sonic-rsyslog-plugin

@@ -507,7 +507,15 @@ def main():
     group.add_argument("--print-data", help="print all data", action='store_true')
     group.add_argument("-w", "--write-to-db", help="write config into configdb", action='store_true')
     group.add_argument("-K", "--key", help="Lookup for a specific key")
+    parser.add_argument(
+        "--writer-profile",
+        help=("authenticate a config DB write with the named Redis client "
+              "profile (host writers use: local-system)"),
+        metavar='PROFILE')
     args = parser.parse_args()
+
+    if args.writer_profile is not None and not args.write_to_db:
+        parser.error("--writer-profile requires -w/--write-to-db")
 
     platform = device_info.get_platform()
     data = {}
@@ -685,7 +693,15 @@ def main():
             load_namespace_config()
             configdb = ConfigDBPipeConnector(use_unix_socket_path=True, namespace=args.namespace, **db_kwargs)
 
-        configdb.connect(False)
+        if args.writer_profile is None:
+            configdb.connect(False)
+        else:
+            # Keep the authentication dependency opt-in while deployments are
+            # migrated.  A writer profile must fail closed: never retry the
+            # write through the legacy unauthenticated connection path.
+            from swsscommon.swsscommon import RedisAuthConfig
+            auth_config = RedisAuthConfig.fromProfile(args.writer_profile)
+            configdb.connect_with_auth(False, False, auth_config)
         configdb.mod_config(FormatConverter.output_to_db(data))
 
     if args.print_data:
