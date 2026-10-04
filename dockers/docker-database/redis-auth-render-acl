@@ -1,0 +1,859 @@
+#!/usr/bin/python3
+"""Render per-process Redis ACL files from Redis supervisor input metadata.
+
+This helper is intentionally not wired into database container startup yet.
+The caller must pass the exact post-transform JSON used to render supervisord
+for that database container. Its served-instance rule mirrors
+supervisord.conf.j2: every INSTANCES entry is a local Redis process except the
+reserved remote_redis client endpoint.
+"""
+
+import argparse
+import errno
+import grp
+import json
+import os
+import re
+import secrets
+import stat
+import sys
+from typing import Iterable, List, Optional, Set, Tuple
+
+
+ACL_FILE_MODE = 0o440
+OUTPUT_DIR_MODE = 0o750
+DATABASE_CONFIG_LIMIT = 4 * 1024 * 1024
+HASH_FILE_LIMIT = 1024
+MANIFEST_LIMIT = 64 * 1024
+MANIFEST_NAME = ".redis-auth-managed.json"
+MANIFEST_VERSION = 1
+REMOTE_INSTANCE = "remote_redis"
+WRITER_USER = "sonic-trusted-writer"
+
+_SAFE_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z", re.ASCII)
+_PASSWORD_HASH = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+_MANAGED_FILE = re.compile(
+    r"redis-auth-([A-Za-z0-9][A-Za-z0-9_-]{0,63})\.acl\Z", re.ASCII
+)
+_STALE_TEMPORARY_FILE = re.compile(
+    r"(?:\.redis-auth-[A-Za-z0-9][A-Za-z0-9_-]{0,63}\.acl|"
+    r"\.\.redis-auth-managed\.json)"
+    r"\.tmp\.(?P<pid>[1-9][0-9]{0,6})\.[0-9a-f]{16}\Z",
+    re.ASCII,
+)
+
+
+class RenderError(Exception):
+    """A validation or filesystem error safe to report without secret data."""
+
+
+class _DuplicateJsonKey(ValueError):
+    pass
+
+
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJsonKey()
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value):
+    raise ValueError()
+
+
+def _read_regular_file(
+    path: str,
+    limit: int,
+    label: str,
+    *,
+    exact_mode: Optional[int] = None,
+    expected_owner_uid: Optional[int] = None,
+) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise RenderError(f"{label} could not be opened safely") from error
+
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+            raise RenderError(f"{label} is not a safe regular file")
+        if (
+            expected_owner_uid is not None
+            and file_stat.st_uid != expected_owner_uid
+        ):
+            raise RenderError(f"{label} has an unexpected owner")
+        if (
+            exact_mode is not None
+            and stat.S_IMODE(file_stat.st_mode) != exact_mode
+        ):
+            raise RenderError(f"{label} permissions are invalid")
+        if file_stat.st_size > limit:
+            raise RenderError(f"{label} is too large")
+
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(65536, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > limit:
+                raise RenderError(f"{label} is too large")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _load_json_bytes(contents: bytes, label: str):
+    try:
+        text = contents.decode("utf-8")
+        return json.loads(
+            text,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        _DuplicateJsonKey,
+        ValueError,
+    ) as error:
+        raise RenderError(f"{label} is not valid JSON") from error
+
+
+def _safe_identifier(value, label: str) -> str:
+    if not isinstance(value, str) or not _SAFE_IDENTIFIER.fullmatch(value):
+        raise RenderError(f"{label} is not an ACL-safe identifier")
+    return value
+
+
+def _validate_endpoint(instance_name: str, endpoint) -> None:
+    if not isinstance(endpoint, dict):
+        raise RenderError(f"Redis instance {instance_name} is not an object")
+
+    hostname = endpoint.get("hostname")
+    if (
+        not isinstance(hostname, str)
+        or not hostname
+        or hostname != hostname.strip()
+        or "\x00" in hostname
+        or len(hostname) > 255
+    ):
+        raise RenderError(
+            f"Redis instance {instance_name} has an invalid hostname"
+        )
+
+    port = endpoint.get("port")
+    if type(port) is not int or port < 0 or port > 65535:
+        raise RenderError(
+            f"Redis instance {instance_name} has an invalid port"
+        )
+
+    socket_path = endpoint.get("unix_socket_path")
+    if (
+        not isinstance(socket_path, str)
+        or "\x00" in socket_path
+        or len(socket_path) > 4096
+    ):
+        raise RenderError(
+            f"Redis instance {instance_name} has an invalid Unix socket path"
+        )
+    if instance_name != REMOTE_INSTANCE and (
+        not socket_path or not os.path.isabs(socket_path)
+    ):
+        raise RenderError(
+            f"Local Redis instance {instance_name} requires an absolute "
+            "Unix socket path"
+        )
+
+
+def _served_instances(database_config) -> List[str]:
+    if not isinstance(database_config, dict):
+        raise RenderError("database configuration root is not an object")
+
+    instances = database_config.get("INSTANCES")
+    databases = database_config.get("DATABASES")
+    if not isinstance(instances, dict) or not instances:
+        raise RenderError(
+            "database configuration INSTANCES is missing or empty")
+    if not isinstance(databases, dict) or not databases:
+        raise RenderError(
+            "database configuration DATABASES is missing or empty")
+
+    for instance_name, endpoint in instances.items():
+        _safe_identifier(instance_name, "Redis instance name")
+        _validate_endpoint(instance_name, endpoint)
+
+    for database_name, database in databases.items():
+        _safe_identifier(database_name, "database name")
+        if not isinstance(database, dict):
+            raise RenderError(f"Database {database_name} is not an object")
+        database_id = database.get("id")
+        if type(database_id) is not int or database_id < 0:
+            raise RenderError(f"Database {database_name} has an invalid id")
+        separator = database.get("separator")
+        if (
+            not isinstance(separator, str)
+            or not separator
+            or "\x00" in separator
+            or len(separator) > 16
+        ):
+            raise RenderError(
+                f"Database {database_name} has an invalid separator")
+        instance_name = database.get("instance")
+        _safe_identifier(instance_name, f"Database {database_name} instance")
+        if instance_name not in instances:
+            raise RenderError(
+                f"Database {database_name} refers to an unknown instance")
+
+    served = sorted(name for name in instances if name != REMOTE_INSTANCE)
+    if not served:
+        raise RenderError(
+            "database configuration has no locally served Redis instances")
+    return served
+
+
+def _load_password_hash(path: str, owner_uid: int) -> str:
+    contents = _read_regular_file(
+        path,
+        HASH_FILE_LIMIT,
+        "writer password hash file",
+        exact_mode=0o400,
+        expected_owner_uid=owner_uid,
+    )
+    try:
+        text = contents.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise RenderError("writer password hash file is invalid") from error
+
+    if text.endswith("\n"):
+        text = text[:-1]
+    if not _PASSWORD_HASH.fullmatch(text):
+        raise RenderError("writer password hash file is invalid")
+    return text
+
+
+def _managed_filename(instance_name: str) -> str:
+    return f"redis-auth-{instance_name}.acl"
+
+
+def _acl_contents(password_hash: str) -> bytes:
+    _safe_identifier(WRITER_USER, "writer username")
+    # The compatibility default keeps existing commands working while writers
+    # migrate, but it must not be able to alter or delete ACL identities.
+    policy = (
+        "user default reset on nopass ~* &* +@all -acl +acl|whoami\n"
+        f"user {WRITER_USER} reset on #{password_hash} "
+        "~* &* +@all -acl +acl|whoami\n"
+    )
+    return policy.encode("ascii")
+
+
+def _directory_open_flags() -> int:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+def _validate_parent_directory(file_stat, owner_uid: int) -> None:
+    if not stat.S_ISDIR(file_stat.st_mode):
+        raise RenderError("ACL output parent component is not a directory")
+    if file_stat.st_uid not in {0, owner_uid}:
+        raise RenderError("ACL output parent component has an untrusted owner")
+    if stat.S_IMODE(file_stat.st_mode) & 0o022:
+        raise RenderError(
+            "ACL output parent component is writable by an untrusted account")
+
+
+def _validate_existing_directory(file_stat, owner_uid: int) -> None:
+    if not stat.S_ISDIR(file_stat.st_mode):
+        raise RenderError("ACL output path is not a directory")
+    if file_stat.st_uid != owner_uid:
+        raise RenderError("ACL output directory has an unexpected owner")
+    if stat.S_IMODE(file_stat.st_mode) & 0o022:
+        raise RenderError(
+            "ACL output directory is writable by an untrusted account")
+
+
+def _open_output_directory(
+    path: str, trust_root: str, owner_uid: int, owner_gid: int
+) -> int:
+    if (
+        not os.path.isabs(path)
+        or os.path.normpath(path) != path
+        or path == "/"
+    ):
+        raise RenderError(
+            "ACL output directory must be a normalized absolute path")
+    if (
+        not os.path.isabs(trust_root)
+        or os.path.normpath(trust_root) != trust_root
+        or not trust_root
+    ):
+        raise RenderError(
+            "ACL path trust root must be a normalized absolute path")
+    try:
+        if (
+            os.path.commonpath((path, trust_root)) != trust_root
+            or path == trust_root
+        ):
+            raise RenderError(
+                "ACL output directory is outside its path trust root")
+    except ValueError as error:
+        raise RenderError(
+            "ACL output directory is outside its path trust root") from error
+
+    relative_path = os.path.relpath(path, trust_root)
+    components = relative_path.split(os.sep)
+    if not components or any(
+        component in {"", ".", ".."} for component in components
+    ):
+        raise RenderError(
+            "ACL output directory contains an unsafe path component")
+
+    opened_parent_fds = []
+    output_fd: Optional[int] = None
+    try:
+        try:
+            trust_root_lstat = os.lstat(trust_root)
+            current_fd = os.open(trust_root, _directory_open_flags())
+        except OSError as error:
+            raise RenderError(
+                "ACL path trust root could not be opened safely") from error
+        opened_parent_fds.append(current_fd)
+        trust_root_stat = os.fstat(current_fd)
+        if (
+            trust_root_stat.st_dev != trust_root_lstat.st_dev
+            or trust_root_stat.st_ino != trust_root_lstat.st_ino
+        ):
+            raise RenderError(
+                "ACL path trust root changed while it was being opened")
+        _validate_parent_directory(trust_root_stat, owner_uid)
+
+        for component in components[:-1]:
+            try:
+                component_lstat = os.stat(
+                    component, dir_fd=current_fd, follow_symlinks=False
+                )
+                next_fd = os.open(
+                    component, _directory_open_flags(), dir_fd=current_fd
+                )
+            except OSError as error:
+                raise RenderError(
+                    "ACL output parent component could not be opened safely"
+                ) from error
+            opened_parent_fds.append(next_fd)
+            component_stat = os.fstat(next_fd)
+            if (
+                component_stat.st_dev != component_lstat.st_dev
+                or component_stat.st_ino != component_lstat.st_ino
+            ):
+                raise RenderError(
+                    "ACL output parent component changed while it was "
+                    "being opened"
+                )
+            _validate_parent_directory(component_stat, owner_uid)
+            current_fd = next_fd
+
+        leaf = components[-1]
+        created = False
+        try:
+            path_stat = os.stat(leaf, dir_fd=current_fd, follow_symlinks=False)
+            _validate_existing_directory(path_stat, owner_uid)
+        except FileNotFoundError:
+            try:
+                os.mkdir(leaf, OUTPUT_DIR_MODE, dir_fd=current_fd)
+                os.fsync(current_fd)
+                created = True
+                path_stat = os.stat(
+                    leaf, dir_fd=current_fd, follow_symlinks=False
+                )
+            except OSError as error:
+                raise RenderError(
+                    "ACL output directory could not be created") from error
+        except OSError as error:
+            raise RenderError(
+                "ACL output directory could not be inspected safely"
+            ) from error
+
+        try:
+            output_fd = os.open(
+                leaf, _directory_open_flags(), dir_fd=current_fd
+            )
+        except OSError as error:
+            raise RenderError(
+                "ACL output directory could not be opened safely") from error
+
+        directory_stat = os.fstat(output_fd)
+        if (
+            directory_stat.st_dev != path_stat.st_dev
+            or directory_stat.st_ino != path_stat.st_ino
+        ):
+            raise RenderError(
+                "ACL output directory changed while it was being opened")
+        if not created:
+            _validate_existing_directory(directory_stat, owner_uid)
+        try:
+            if created or directory_stat.st_gid != owner_gid:
+                os.fchown(output_fd, owner_uid, owner_gid)
+            os.fchmod(output_fd, OUTPUT_DIR_MODE)
+        except OSError as error:
+            raise RenderError(
+                "ACL output directory metadata could not be enforced"
+            ) from error
+
+        final_stat = os.fstat(output_fd)
+        if (
+            final_stat.st_uid != owner_uid
+            or final_stat.st_gid != owner_gid
+            or stat.S_IMODE(final_stat.st_mode) != OUTPUT_DIR_MODE
+        ):
+            raise RenderError(
+                "ACL output directory metadata could not be enforced")
+        os.fsync(output_fd)
+        result_fd = output_fd
+        output_fd = None
+        return result_fd
+    finally:
+        if output_fd is not None:
+            os.close(output_fd)
+        for parent_fd in reversed(opened_parent_fds):
+            os.close(parent_fd)
+
+
+def _stat_at(directory_fd: int, name: str):
+    try:
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise RenderError(
+            "managed ACL path could not be inspected safely") from error
+
+
+def _validate_managed_file_stat(
+    file_stat, owner_uid: int, owner_gid: int, label: str
+) -> None:
+    if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+        raise RenderError(f"{label} is not a safe regular file")
+    if file_stat.st_uid != owner_uid or file_stat.st_gid != owner_gid:
+        raise RenderError(f"{label} has unexpected ownership")
+    if stat.S_IMODE(file_stat.st_mode) & 0o022:
+        raise RenderError(f"{label} is writable by an untrusted account")
+
+
+def _read_at(
+    directory_fd: int, name: str, limit: int, label: str
+) -> Tuple[bytes, os.stat_result]:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as error:
+        raise RenderError(f"{label} could not be opened safely") from error
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+            raise RenderError(f"{label} is not a safe regular file")
+        if file_stat.st_size > limit:
+            raise RenderError(f"{label} is too large")
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(65536, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > limit:
+                raise RenderError(f"{label} is too large")
+        return b"".join(chunks), file_stat
+    finally:
+        os.close(fd)
+
+
+def _load_manifest(directory_fd: int, owner_uid: int,
+                   owner_gid: int) -> Set[str]:
+    manifest_stat = _stat_at(directory_fd, MANIFEST_NAME)
+    if manifest_stat is None:
+        return set()
+    _validate_managed_file_stat(
+        manifest_stat, owner_uid, owner_gid, "ACL renderer manifest"
+    )
+    contents, opened_stat = _read_at(
+        directory_fd, MANIFEST_NAME, MANIFEST_LIMIT, "ACL renderer manifest"
+    )
+    _validate_managed_file_stat(
+        opened_stat, owner_uid, owner_gid, "ACL renderer manifest"
+    )
+    manifest = _load_json_bytes(contents, "ACL renderer manifest")
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "schema_version",
+        "files",
+    }:
+        raise RenderError("ACL renderer manifest has an invalid schema")
+    if (
+        type(manifest["schema_version"]) is not int
+        or manifest["schema_version"] != MANIFEST_VERSION
+    ):
+        raise RenderError("ACL renderer manifest has an unsupported version")
+    files = manifest["files"]
+    if not isinstance(files, list) or not all(
+        isinstance(name, str) for name in files
+    ):
+        raise RenderError("ACL renderer manifest file list is invalid")
+    if files != sorted(files) or len(files) != len(set(files)):
+        raise RenderError("ACL renderer manifest file list is invalid")
+    for name in files:
+        if not isinstance(name, str) or not _MANAGED_FILE.fullmatch(name):
+            raise RenderError(
+                "ACL renderer manifest contains an unsafe filename")
+    return set(files)
+
+
+def _scan_managed_acl_files(
+    directory_fd: int, owner_uid: int, owner_gid: int
+) -> Set[str]:
+    try:
+        entries = os.listdir(directory_fd)
+    except OSError as error:
+        raise RenderError(
+            "ACL output directory could not be enumerated safely") from error
+
+    managed = set()
+    for name in entries:
+        if not name.startswith("redis-auth-"):
+            continue
+        if not _MANAGED_FILE.fullmatch(name):
+            raise RenderError(
+                "ACL output directory contains an invalid reserved filename")
+        file_stat = _stat_at(directory_fd, name)
+        if file_stat is None:
+            raise RenderError(
+                "managed ACL file changed while it was being inspected")
+        _validate_managed_file_stat(
+            file_stat, owner_uid, owner_gid, "managed ACL file"
+        )
+        managed.add(name)
+    return managed
+
+
+def _validate_stale_temporary_file_stat(
+    file_stat, owner_uid: int, owner_gid: int
+) -> None:
+    if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+        raise RenderError(
+            "stale ACL temporary path is not a safe regular file")
+    if file_stat.st_uid != owner_uid:
+        raise RenderError("stale ACL temporary file has unexpected ownership")
+    if file_stat.st_gid not in {owner_gid, os.getegid()}:
+        raise RenderError("stale ACL temporary file has unexpected ownership")
+    if stat.S_IMODE(file_stat.st_mode) not in {
+        0o000,
+        0o200,
+        0o400,
+        0o600,
+        ACL_FILE_MODE,
+    }:
+        raise RenderError("stale ACL temporary file has unsafe permissions")
+    if file_stat.st_size > MANIFEST_LIMIT:
+        raise RenderError("stale ACL temporary file is too large")
+
+
+def _process_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as error:
+        raise RenderError(
+            "stale ACL temporary file owner process could not be checked"
+        ) from error
+    return True
+
+
+def _reconcile_stale_temporary_files(
+    directory_fd: int, owner_uid: int, owner_gid: int
+) -> None:
+    try:
+        entries = os.listdir(directory_fd)
+    except OSError as error:
+        raise RenderError(
+            "ACL output directory could not be enumerated safely") from error
+
+    removed = False
+    for name in entries:
+        match = _STALE_TEMPORARY_FILE.fullmatch(name)
+        if match is None:
+            continue
+        file_stat = _stat_at(directory_fd, name)
+        if file_stat is None:
+            continue
+        _validate_stale_temporary_file_stat(
+            file_stat, owner_uid, owner_gid
+        )
+        if _process_is_running(int(match.group("pid"), 10)):
+            continue
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+            removed = True
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise RenderError(
+                "stale ACL temporary file could not be removed") from error
+    if removed:
+        os.fsync(directory_fd)
+
+
+def _write_all(fd: int, contents: bytes) -> None:
+    offset = 0
+    while offset < len(contents):
+        written = os.write(fd, contents[offset:])
+        if written <= 0:
+            raise OSError(errno.EIO, "short write")
+        offset += written
+
+
+def _atomic_write_at(
+    directory_fd: int,
+    name: str,
+    contents: bytes,
+    owner_uid: int,
+    owner_gid: int,
+) -> bool:
+    existing_stat = _stat_at(directory_fd, name)
+    if existing_stat is not None:
+        _validate_managed_file_stat(
+            existing_stat, owner_uid, owner_gid, "managed ACL file"
+        )
+        existing_contents, opened_stat = _read_at(
+            directory_fd,
+            name,
+            max(len(contents), MANIFEST_LIMIT),
+            "managed ACL file",
+        )
+        _validate_managed_file_stat(
+            opened_stat, owner_uid, owner_gid, "managed ACL file"
+        )
+        if (
+            existing_contents == contents
+            and stat.S_IMODE(opened_stat.st_mode) == ACL_FILE_MODE
+        ):
+            return False
+
+    temporary_name = f".{name}.tmp.{os.getpid()}.{secrets.token_hex(8)}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd: Optional[int] = None
+    try:
+        fd = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+        _write_all(fd, contents)
+        os.fchown(fd, owner_uid, owner_gid)
+        os.fchmod(fd, ACL_FILE_MODE)
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+        return True
+    except OSError as error:
+        raise RenderError(
+            "managed ACL file could not be replaced atomically") from error
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def _render(
+    database_config_path: str,
+    password_hash_path: str,
+    output_directory: str,
+    path_trust_root: str,
+    owner_uid: int,
+    owner_gid: int,
+) -> int:
+    database_config = _load_json_bytes(
+        _read_regular_file(
+            database_config_path,
+            DATABASE_CONFIG_LIMIT,
+            "database configuration",
+        ),
+        "database configuration",
+    )
+    instances = _served_instances(database_config)
+    password_hash = _load_password_hash(password_hash_path, owner_uid)
+    acl_contents = _acl_contents(password_hash)
+
+    desired = {
+        _managed_filename(instance): acl_contents for instance in instances
+    }
+    directory_fd = _open_output_directory(
+        output_directory, path_trust_root, owner_uid, owner_gid
+    )
+    try:
+        _reconcile_stale_temporary_files(
+            directory_fd, owner_uid, owner_gid
+        )
+        _load_manifest(directory_fd, owner_uid, owner_gid)
+        existing_managed = _scan_managed_acl_files(
+            directory_fd, owner_uid, owner_gid
+        )
+
+        # The redis-auth- prefix is reserved for this renderer.  Scanning it
+        # allows a later invocation to recover if power is lost after an ACL
+        # rename but before the manifest rename.
+        for name in sorted(existing_managed | set(desired)):
+            file_stat = _stat_at(directory_fd, name)
+            if file_stat is not None:
+                _validate_managed_file_stat(
+                    file_stat, owner_uid, owner_gid, "managed ACL file"
+                )
+
+        for name in sorted(desired):
+            _atomic_write_at(
+                directory_fd, name, desired[name], owner_uid, owner_gid
+            )
+
+        removed = False
+        for name in sorted(existing_managed - set(desired)):
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+                removed = True
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                raise RenderError(
+                    "stale managed ACL file could not be removed") from error
+        if removed:
+            os.fsync(directory_fd)
+
+        final_managed = _scan_managed_acl_files(
+            directory_fd, owner_uid, owner_gid
+        )
+        if final_managed != set(desired):
+            raise RenderError("managed ACL file set could not be reconciled")
+
+        manifest_contents = (
+            json.dumps(
+                {
+                    "schema_version": MANIFEST_VERSION,
+                    "files": sorted(desired),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("ascii")
+        _atomic_write_at(
+            directory_fd,
+            MANIFEST_NAME,
+            manifest_contents,
+            owner_uid,
+            owner_gid,
+        )
+        return len(instances)
+    finally:
+        os.close(directory_fd)
+
+
+def _nonnegative_integer(value: str) -> int:
+    try:
+        number = int(value, 10)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "must be a non-negative integer") from error
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return number
+
+
+def _default_redis_gid() -> int:
+    try:
+        return grp.getgrnam("redis").gr_gid
+    except KeyError as error:
+        raise RenderError(
+            "redis group is unavailable; specify --owner-gid") from error
+
+
+def _argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Render per-process Redis ACL files from finalized SONiC DB "
+            "metadata"
+        )
+    )
+    parser.add_argument("--database-config", required=True)
+    parser.add_argument("--writer-password-hash", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--path-trust-root",
+        default="/",
+        help=(
+            "trusted absolute root for output path traversal "
+            "(tests/chroots only)"
+        ),
+    )
+    parser.add_argument("--owner-uid", type=_nonnegative_integer, default=0)
+    parser.add_argument("--owner-gid", type=_nonnegative_integer)
+    return parser
+
+
+def main(argv: Optional[Iterable[str]] = None) -> int:
+    args = _argument_parser().parse_args(argv)
+    try:
+        owner_gid = (
+            args.owner_gid
+            if args.owner_gid is not None
+            else _default_redis_gid()
+        )
+        count = _render(
+            args.database_config,
+            args.writer_password_hash,
+            args.output_dir,
+            args.path_trust_root,
+            args.owner_uid,
+            owner_gid,
+        )
+    except RenderError as error:
+        print(f"redis-auth-render-acl: error: {error}", file=sys.stderr)
+        return 1
+    except OSError:
+        print(
+            "redis-auth-render-acl: error: filesystem operation failed",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Rendered ACL policy for {count} local Redis instance(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
