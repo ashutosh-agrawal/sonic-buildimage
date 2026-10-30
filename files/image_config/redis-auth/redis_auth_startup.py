@@ -2,6 +2,7 @@
 """Prepare the explicitly selected local Redis processes before database startup."""
 
 import argparse
+import configparser
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ INTENT = Path('/etc/sonic/redis-auth.json')
 RUNTIME = Path('/run/redis-auth')
 BUILD_SETTING = Path('/usr/share/sonic/redis-auth/build-enabled')
 CONFIG = Path('/etc/sonic')
+NETNS = Path('/run/netns')
 DATABASE_TEMPLATE = Path('/usr/share/sonic/redis-auth/database_config.json.j2')
 USERNAME = 'sonic-trusted-writer'
 READ_RULES = ('reset on nopass ~* &* -@all +@read +@transaction '
@@ -63,35 +65,99 @@ def read_intent(path=INTENT):
     return {'mode': intent.get('mode', 'legacy'), 'tcp_exceptions': sorted(exceptions)}
 
 
+def effective_override(name):
+    saved = CONFIG / 'old_config' / name
+    return saved if os.path.lexists(saved) else CONFIG / name
+
+
+def platform_settings(path):
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read_string('[platform]\n' + read_setting(path))
+    if parser.sections() != ['platform'] or parser.defaults():
+        raise CredentialStateError('unsupported platform assignment format')
+    return parser['platform']
+
+
+def platform_layout():
+    # These APIs read platform files without connecting to ConfigDB.
+    from sonic_py_common import device_info
+    platform = device_info.get_platform(config_db=None)
+    if not platform or platform in ('.', '..') or Path(platform).name != platform:
+        raise CredentialStateError('unknown Redis platform identity')
+    directory = Path(device_info.HOST_DEVICE_PATH) / platform
+    alias = Path(device_info.CONTAINER_PLATFORM_PATH)
+    if not directory.is_dir() or (os.path.lexists(alias) and alias.resolve() != directory.resolve()):
+        raise CredentialStateError('missing or conflicting Redis platform directory')
+    path = device_info.get_asic_conf_file_path()
+    # A missing optional file means one ASIC; a broken file must not do so.
+    if path is None and os.path.lexists(directory / 'asic.conf'):
+        raise CredentialStateError('unreadable ASIC configuration')
+    count = int(platform_settings(path)['num_asic']) if path else 1
+    if count < 1:
+        raise CredentialStateError('invalid ASIC count')
+    return directory, [''] + ([str(index) for index in range(count)] if count > 1 else [])
+
+
+def check_layout(directory, numbers):
+    source = CONFIG / ('old_config' if os.path.lexists(CONFIG / 'pending_config_migration') else '')
+    metadata = json.loads(read_setting(source / 'config_db.json'))['DEVICE_METADATA']['localhost']
+    environment = directory / 'platform_env.conf'
+    flags = platform_settings(environment) if os.path.lexists(environment) else {}
+    platform = directory / 'platform.json'
+    data = json.loads(read_setting(platform)) if os.path.lexists(platform) else {}
+    roles = {'ToRRouter', 'LeafRouter', 'BackEndToRRouter', 'BackEndLeafRouter',
+             'ToRSwitch', 'MgmtToRRouter', 'MgmtLeafRouter', 'MgmtAccessRouter'}
+    if (metadata.get('platform') != directory.name or metadata.get('switch_type', 'npu') != 'npu'
+            or metadata.get('type') not in roles or metadata.get('subtype') not in (None, 'DualToR')
+            or any(flags.get(key, '0') != '0' for key in ('supervisor', 'disaggregated_chassis', 'switch_bmc'))
+            or not isinstance(data, dict) or 'DPU' in data or 'DPUS' in data
+            or os.path.lexists(directory / 'chassisdb.conf')
+            or any(os.path.lexists(base / 'chassisdb_address') for base in (CONFIG, CONFIG / 'old_config'))):
+        raise CredentialStateError('unsupported Redis chassis, DPU, BMC or host role')
+    allowed = {prefix + number + '.json' for number in numbers for prefix in ('config_db', 'database_config')}
+    expected = {'asic' + number for number in numbers if number}
+    if (not {path.name for path in NETNS.glob('asic*')} <= expected
+            or any(path.name not in allowed for base in (CONFIG, CONFIG / 'old_config')
+                   for prefix in ('config_db', 'database_config') for path in base.glob(prefix + '[0-9]*.json'))
+            or any(list(base.glob('database_config*dpu*.json')) for base in (CONFIG, CONFIG / 'old_config'))):
+        raise CredentialStateError('unsupported Redis namespace layout')
+    path = effective_override('database_global.json')
+    includes = [{'include': '../../redis' + number + '/sonic-db/database_config.json',
+                 **({'namespace': 'asic' + number} if number else {})} for number in numbers]
+    if os.path.lexists(path) and json.loads(read_setting(path))['INCLUDES'] != includes:
+        raise CredentialStateError('unsupported Redis global database includes')
+
+
 def configured_instances():
-    """Use the same saved override or standard host template as the database entrypoint."""
-    if (CONFIG / 'enable_multidb').exists():
+    """Describe host and ASIC sockets before any database container starts."""
+    if any(os.path.lexists(base / 'enable_multidb') for base in (CONFIG, CONFIG / 'old_config')):
         raise CredentialStateError('the multi-database layout is not qualified for enforcement')
-    try:
-        override = CONFIG / 'old_config/database_config.json'
-        if not os.path.lexists(override):
-            override = CONFIG / 'database_config.json'
-        database = json.loads(read_setting(override))
-    except FileNotFoundError:
-        import jinja2
-        database = json.loads(jinja2.Template(read_setting(DATABASE_TEMPLATE)).render(
-            HOST_IP='127.0.0.1', REDIS_PORT=6379, BMP_DB_PORT=6400, DEV='', DATABASE_TYPE=''))
-    instances = dict(database['INSTANCES'])
-    # The entrypoint removes this reference before launching standalone servers.
-    instances.pop('redis_chassis', None)
-    if not instances:
-        raise CredentialStateError('no configured local Redis processes')
-    sockets = set()
-    for name, instance in instances.items():
-        path = instance['unix_socket_path']
-        if (name == 'remote_redis' or instance['hostname'] != '127.0.0.1' or instance.get('database_type')
-                or instance.get('bmc_link_ip') or not isinstance(path, str)
-                or Path(path).parent != Path('/var/run/redis') or '..' in Path(path).parts
-                or path in sockets or type(instance['port']) is not int or not 0 <= instance['port'] <= 65535):
-            raise CredentialStateError('Redis inventory requires distinct qualified local endpoints')
-        sockets.add(path)
-    return {name: {key: instance[key] for key in ('hostname', 'port', 'unix_socket_path')}
-            for name, instance in sorted(instances.items())}
+    _, numbers = platform_layout()
+    result, sockets = {}, set()
+    for number in numbers:
+        try:
+            database = json.loads(read_setting(effective_override('database_config' + number + '.json')))
+        except FileNotFoundError:
+            import jinja2
+            database = json.loads(jinja2.Template(read_setting(DATABASE_TEMPLATE)).render(
+                HOST_IP='127.0.0.1', REDIS_PORT=6379, BMP_DB_PORT=6400, DEV=number, DATABASE_TYPE=''))
+        instances = dict(database['INSTANCES'])
+        # This standard template placeholder does not name an owned server.
+        instances.pop('redis_chassis', None)
+        if not instances or (number and set(instances) != {'redis', 'redis_bmp'}):
+            raise CredentialStateError('expected the standard local Redis namespace layout')
+        for name, instance in sorted(instances.items()):
+            path = instance['unix_socket_path']
+            if (not isinstance(name, str) or '/' in name or name == 'remote_redis'
+                    or instance['hostname'] != '127.0.0.1' or instance.get('database_type')
+                    or instance.get('bmc_link_ip') or not isinstance(path, str)
+                    or Path(path).parent != Path('/var/run/redis' + number) or '..' in Path(path).parts
+                    or path in sockets or type(instance['port']) is not int or not 0 <= instance['port'] <= 65535):
+                raise CredentialStateError('Redis inventory requires distinct qualified local endpoints')
+            sockets.add(path)
+            result[('asic' + number + '/' if number else '') + name] = {
+                key: instance[key] for key in ('hostname', 'port', 'unix_socket_path')}
+    return result
 
 
 def selection(path=INTENT):
@@ -100,9 +166,11 @@ def selection(path=INTENT):
         return [], {}
     instances = configured_instances()
     exceptions = set(intent['tcp_exceptions'])
-    if exceptions - instances.keys() or any(instances[name]['port'] == 0 for name in exceptions):
+    names = {identity.rsplit('/', 1)[-1] for identity in instances}
+    if exceptions - names or any(item['port'] == 0 for identity, item in instances.items()
+                                 if identity.rsplit('/', 1)[-1] in exceptions):
         raise CredentialStateError('TCP exceptions must name configured TCP processes')
-    selected = sorted(instances.keys() - exceptions)
+    selected = sorted(identity for identity in instances if identity.rsplit('/', 1)[-1] not in exceptions)
     if not selected:
         raise CredentialStateError('enforcement must select at least one local Redis process')
     for name, instance in instances.items():
@@ -161,6 +229,8 @@ def prepare_selected(*, intent_path=INTENT, runtime=RUNTIME):
         if (runtime / 'local.json').exists():
             raise CredentialStateError('activation changed during this boot; reboot after changing intent')
         return []
+    if not (runtime / 'local.json').exists():
+        check_layout(*platform_layout())
     files = policy_files(selected, instances)
     for relative, content in files.items():
         path = runtime / relative
@@ -200,7 +270,7 @@ def main():
             print('enforce' if runtime_required() else 'legacy')
             return 0
         selected = prepare_selected()
-    except (CredentialStateError, OSError, ValueError, KeyError, TypeError):
+    except (CredentialStateError, OSError, ValueError, KeyError, TypeError, AttributeError, configparser.Error):
         print('redis-auth-startup: invalid activation or runtime state', file=sys.stderr)
         return 1
     message = 'legacy'
