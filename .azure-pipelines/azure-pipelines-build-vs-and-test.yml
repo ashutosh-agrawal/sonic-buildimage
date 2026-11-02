@@ -97,7 +97,7 @@ stages:
     jobs:
     - template: azure-pipelines-build.yml
       parameters:
-        buildOptions: 'USERNAME=admin SONIC_BUILD_JOBS=$(nproc) BUILD_MULTIASIC_KVM=y INCLUDE_DHCP_SERVER=y ${{ variables.  VERSION_CONTROL_OPTIONS }} INCLUDE_RESTAPI=n ENABLE_ZTP=n INCLUDE_P4RT=n'
+        buildOptions: 'USERNAME=admin SONIC_BUILD_JOBS=$(nproc) BUILD_MULTIASIC_KVM=y INCLUDE_DHCP_SERVER=y ${{ variables.  VERSION_CONTROL_OPTIONS }}'
         jobGroups:
         - name: vs
         SUBMODULE: ${{ parameters.SUBMODULE }}
