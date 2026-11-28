@@ -44,6 +44,7 @@
   * [FABRIC_PORT](#fabric-port)
   * [FLEX_COUNTER_TABLE](#flex_counter_table)
   * [GNMI](#gnmi)
+  * [GNMI_CLIENT](#gnmi_client)
   * [GRPCCLIENT](#grpcclient)
   * [Hash](#hash)
   * [KDUMP](#kdump)
@@ -545,6 +546,11 @@ The table key can be a plain neighbor IP (e.g. `BGP_NEIGHBOR|10.0.0.61`) or a
 `vrf_name|neighbor` pair (e.g. `BGP_NEIGHBOR|default|10.0.0.61`). In the second
 form, `vrf_name` accepts a VRF name (e.g. `default`, `Vrf1`) or a VNet name
 (e.g. `Vnet1`) for overlay BGP neighbors.
+
+An unnumbered neighbor is keyed by a port, port channel, VLAN or VLAN sub-interface,
+which must exist in `PORT`, `PORTCHANNEL`, `VLAN` or `VLAN_SUB_INTERFACE`.
+`local_addr` may name a port, port channel, loopback or VLAN, which must exist in
+`PORT`, `PORTCHANNEL`, `LOOPBACK_INTERFACE` or `VLAN`.
 
 ```
 {
@@ -1210,6 +1216,9 @@ instance is supported in SONiC.
 
 ### DHCPV4_RELAY
 
+The key names a VLAN, which must exist in `VLAN`. `source_interface` must exist in `PORT`,
+`PORTCHANNEL`, `VLAN` or `LOOPBACK_INTERFACE`.
+
 ```
 {
 "DHCPV4_RELAY": {
@@ -1247,6 +1256,7 @@ BMP related configuration are defined in **bgp_neighbor_table**,**bgp_rib_in_tab
 
 ### DHCP_SERVER_IPV4
 IPV4 DHCP Server related configuration are defined in **DHCP_SERVER_IPV4**, **DHCP_SERVER_IPV4_CUSTOMIZED_OPTIONS**, **DHCP_SERVER_IPV4_RANGE**, **DHCP_SERVER_IPV4_PORT**, **DHCP_SERVER_IPV4_MATCH**, **DHCP_SERVER_IPV4_BINDING** tables.
+The **DHCP_SERVER_IPV4** key names a VLAN, which must exist in `VLAN`, or the midplane bridge.
 ```
 {
     "DHCP_SERVER_IPV4": {
@@ -1648,6 +1658,22 @@ GNMI (gRPC Network Management Interface) related configuration is defined in the
     "GNMI_CLIENT_CERT": {
         "client.sonic.net": {
             "role": ["admin", "operator"]
+        }
+    }
+}
+```
+
+### GNMI_CLIENT
+
+The **GNMI_CLIENT** table holds the credentials this device presents when it acts as a gRPC client of another SONiC device's gNMI server (mTLS). On a BMC, the BMC daemon uses them for the gNOI System.Reboot handshake with the switch host; the files must be visible inside the BMC's PMON container, and an absent field falls back to the daemon's default path. File names follow the GNMI table's rules: certificates end in `.cer`, keys in `.key`. `ca_crt` is the CA certificate that the client uses to verify the server. When one CA issues the gNMI certificates, use the same CA file as `ca_crt` in the GNMI table. GNMI_CLIENT_CERT is the opposite direction: the clients this device's own gNMI server accepts.
+
+```
+{
+    "GNMI_CLIENT": {
+        "certs": {
+            "ca_crt": "/etc/sonic/credentials/dsmsroot.cer",
+            "client_crt": "/etc/sonic/credentials/gnmi_client.cer",
+            "client_key": "/etc/sonic/credentials/gnmi_client.key"
         }
     }
 }
@@ -2065,6 +2091,7 @@ The **MUX_LINKMGR** table is used for dualtor device configuration.
 ### NEIGH
 
 The **NEIGH** table is used to keep track of resolved and static neighbors.
+The interface in the key must exist in `PORT`, `PORTCHANNEL` or `VLAN`.
 
 Resolve case:
 ```
@@ -3527,6 +3554,7 @@ For the flags that can be changed by reconfiguration, we can update entries in `
 ### RADIUS
 
 The RADIUS and RADIUS_SERVER tables define RADIUS configuration parameters. RADIUS table carries global configuration while RADIUS_SERVER table carries per server configuration.
+A RADIUS_SERVER `src_intf` must exist in `PORT`, `PORTCHANNEL`, `VLAN`, `LOOPBACK_INTERFACE` or `MGMT_PORT`.
 
 ```
    "RADIUS": {
@@ -3868,7 +3896,7 @@ Like NTP global configuration, DASH HA global configuration must have one entry 
 
 **dpu_vnet**: Name of the vnet used for VNET tunnel route in SmartSwitch HA scenarios. Replaces `vnet_name`.
 
-**dpu_vlan**: DPU VLAN identifier, referencing a VLAN name from the VLAN table.
+**dpu_vlan**: The VLAN hamgrd resolves the DPU PA address on; it must exist in the VLAN table.
 
 **cp_data_channel_port**: Control plane data channel port, used for bulk sync.
 

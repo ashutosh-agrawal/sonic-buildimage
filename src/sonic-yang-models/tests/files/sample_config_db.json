@@ -506,6 +506,10 @@
                 "vlanid": "12",
                 "mtu": "9216",
                 "admin_status": "up"
+            },
+            "Vlan222": {
+                "description": "dhcpv4 relay",
+                "vlanid": "222"
             }
 
         },
@@ -1470,6 +1474,13 @@
                 "bgp_neighbor_table": "true",
                 "bgp_rib_in_table": "false",
                 "bgp_rib_out_table": "false"
+            }
+        },
+        "GNMI_CLIENT": {
+            "certs": {
+                "ca_crt": "/etc/sonic/credentials/dsmsroot.cer",
+                "client_crt": "/etc/sonic/credentials/gnmi_client.cer",
+                "client_key": "/etc/sonic/credentials/gnmi_client.key"
             }
         },
         "GNMI": {
