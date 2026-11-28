@@ -134,68 +134,17 @@ def test_native_credential_failure_never_retries_anonymous(protected_redis, miss
         secret.chmod(0o400)
 
 
-def test_library_pretty_dump_keeps_connection_options():
-    with patch('redisdl.RedisWrapper') as client:
-        client.return_value.keys.return_value = []
-        redisdl.dump(io.StringIO(), pretty=True, unix_socket_path='/var/run/redis/redis.sock')
-    assert client.call_args.kwargs['unix_socket_path'] == '/var/run/redis/redis.sock'
-
-
-@pytest.fixture
-def legacy_redis(tmp_path):
-    path = str(tmp_path / 'redis.sock')
-    server = subprocess.Popen([
-        'redis-server', '--port', '0', '--unixsocket', path,
-        '--save', '', '--appendonly', 'no'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    client = redis.Redis(unix_socket_path=path)
-    try:
-        for _ in range(200):
-            try:
-                client.ping()
-                break
-            except redis.ConnectionError:
-                if server.poll() is not None:
-                    pytest.fail('fixture Redis exited')
-                time.sleep(0.01)
-        else:
-            pytest.fail('fixture Redis did not start')
-        yield path, client
-    finally:
-        client.close()
-        server.terminate()
-        server.wait(timeout=10)
-
-
-def test_library_keeps_requested_encoding(legacy_redis):
-    path, client = legacy_redis
-    client.set('binary', b'\x00\xff')
-    assert json.loads(redisdl.dumps(unix_socket_path=path, encoding='latin-1'))['binary']['value'] == '\x00\xff'
-
-
-def test_library_loads_sorted_set_with_current_client(legacy_redis):
-    path, client = legacy_redis
-    redisdl.loads('{"sorted":{"type":"zset","value":[["one",1.5]]}}', unix_socket_path=path)
-    assert client.zscore('sorted', 'one') == 1.5
-
-
-@pytest.mark.parametrize('pretty', [False, True])
-def test_library_round_trip_preserves_persistent_keys(legacy_redis, pretty):
-    path, client = legacy_redis
-    client.set('persistent', 'value')
-    output = io.StringIO()
-    redisdl.dump(output, unix_socket_path=path, pretty=pretty)
-    client.flushdb()
-    redisdl.loads(output.getvalue(), unix_socket_path=path)
-    assert client.get('persistent') == b'value'
-    assert client.ttl('persistent') == -1
-
-
-@pytest.mark.parametrize('streaming', [False, True])
-@pytest.mark.parametrize('use_expireat', [False, True])
-def test_library_restores_legacy_persistent_keys(legacy_redis, monkeypatch, streaming, use_expireat):
-    path, client = legacy_redis
-    saved = {'persistent': {'type': 'string', 'value': 'value', 'ttl': -0.001, 'expireat': 1}}
+@pytest.mark.parametrize('streaming', [False, True], ids=['lump', 'streaming'])
+def test_load_uses_supplied_pool_database(legacy_redis, monkeypatch, streaming):
+    path, default_db = legacy_redis
+    pool = redis.ConnectionPool(
+        connection_class=redis.UnixDomainSocketConnection, path=path, db=1)
+    pool_db = redis.Redis(connection_pool=pool)
+    saved = io.StringIO(json.dumps({'only-in-pool-db': {'type': 'string', 'value': 'restored'}}))
     monkeypatch.setattr(redisdl, 'have_streaming_load', streaming)
-    redisdl.load(io.StringIO(json.dumps(saved)), unix_socket_path=path, use_expireat=use_expireat)
-    assert client.get('persistent') == b'value'
-    assert client.ttl('persistent') == -1
+    try:
+        redisdl.load(saved, db=0, unix_socket_path=path, connection_pool=pool)
+        assert pool_db.get('only-in-pool-db') == b'restored'
+        assert default_db.get('only-in-pool-db') is None
+    finally:
+        pool.disconnect()

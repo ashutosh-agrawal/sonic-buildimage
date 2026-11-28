@@ -116,10 +116,19 @@ def test_tcp_retains_endpoint_without_native_pool(endpoint, command, port):
 def test_unix_dump_keeps_reader_and_namespace(endpoint, pretty):
     config, pool = endpoint
     argv = ['sonic-db-dump', '-n', 'STATE_DB', '--netns', 'asic0', '-t', 'unix_socket']
-    with patch.object(sys, 'argv', argv + (['-y'] if pretty else [])), patch('redisdl.dump') as dump:
+    output = io.StringIO()
+    with patch.object(sys, 'argv', argv + (['-y'] if pretty else [])), \
+            patch('sys.stdout', output), patch('redisdl.dump') as dump, \
+            patch('redisdl.dumps', return_value='{"key": {}}') as dumps:
         sonic_db_dump_load()
-    assert dump.call_args.kwargs['unix_socket_path'] == '/run/redis/state.sock'
-    assert dump.call_args.kwargs.get('pretty', False) == pretty
+    if pretty:
+        dump.assert_not_called()
+        assert dumps.call_args.kwargs['pretty'] is True
+        assert dumps.call_args.kwargs['unix_socket_path'] == '/run/redis/state.sock'
+        assert output.getvalue() == '{"key": {}}'
+    else:
+        dumps.assert_not_called()
+        assert dump.call_args.kwargs['unix_socket_path'] == '/run/redis/state.sock'
     assert config.getDbSock.call_args.args[1].netns == 'asic0'
     config.initializeGlobalConfig.assert_called_once_with()
     config.getDbPort.assert_not_called()
