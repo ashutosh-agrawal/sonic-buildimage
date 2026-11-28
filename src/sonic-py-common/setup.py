@@ -85,10 +85,11 @@ setup_args = dict(
     ],
     tests_require=[
         'pytest',
+        'ijson',
         'mock==3.0.5' # For python 2. Version >=4.0.0 drops support for py2
     ],
     extras_require={
-        'testing': ['pytest'],
+        'testing': ['pytest', 'ijson'],
     },
     entry_points={
         'console_scripts': [
